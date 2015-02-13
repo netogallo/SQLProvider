@@ -44,8 +44,13 @@ type SqlEntity(dc:ISqlDataContext,tableName:string) =
     let table = Table.FromFullName tableName
     let propertyChanged = Event<_,_>()
     
-    let data = Dictionary<string,obj>()
+    let data = Dictionary<string,Choice<obj,ReferenceValue>>()
     let aliasCache = new Dictionary<string,SqlEntity>(HashIdentity.Structural)
+
+    let derefEntity v =
+        match v with
+        | Choice1Of2 v' -> v'
+        | Choice2Of2 er -> er.Entity.GetColumn er.Field
 
     let replaceFirst (text:string) (oldValue:string) (newValue) =
         let position = text.IndexOf oldValue
@@ -63,7 +68,12 @@ type SqlEntity(dc:ISqlDataContext,tableName:string) =
     member internal e.TriggerPropertyChange(name) = 
         propertyChanged.Trigger(e,PropertyChangedEventArgs(name))
 
-    member e.ColumnValues = seq { for kvp in data -> kvp.Key, kvp.Value }
+    member e.ColumnValues = seq { for kvp in data -> kvp.Key, kvp.Value |> derefEntity}
+
+    member e.Relations = seq { for kvp in data do 
+                                match kvp.Value with
+                                | Choice2Of2 rel -> yield (kvp.Key,rel)
+                                | _ -> ()}
 
     member e.Table= table
 
@@ -74,7 +84,7 @@ type SqlEntity(dc:ISqlDataContext,tableName:string) =
             if typeof<'T> = typeof<string> then (box String.Empty) :?> 'T
             else Unchecked.defaultof<'T>
         if data.ContainsKey key then
-           match data.[key] with
+           match data.[key] |> derefEntity with
            | null -> defaultValue()
            | :? System.DBNull -> defaultValue()
             //This deals with an oracle specific case where the type mappings says it returns a System.Decimal but actually returns a float!?!?!  WTF...
@@ -84,7 +94,7 @@ type SqlEntity(dc:ISqlDataContext,tableName:string) =
     
     member e.GetColumnOption<'T>(key) : Option<'T> =   
        if data.ContainsKey key then
-           match data.[key] with
+           match data.[key] |> derefEntity with
            | null -> None
            | :? System.DBNull -> None
            | data when data.GetType() <> typeof<'T> && typeof<'T> <> typeof<obj> -> Some(unbox<'T> <| Convert.ChangeType(data, typeof<'T>))           
@@ -102,31 +112,56 @@ type SqlEntity(dc:ISqlDataContext,tableName:string) =
         | Deleted -> failwith "You cannot modify an entity that is pending deletion"
         | Created -> ()
 
-    member e.SetColumnSilent(key,value) =
-        data.[key] <- value                
+    member e.SetColumnSilentAny(key,value) =
+        data.[key] <- value
 
-    member e.SetColumn(key,value) =        
+    member e.SetColumnSilent(key,value) = e.SetColumnSilentAny(key,Choice1Of2 value)
+
+    member e.SetRefColumnSilent(key,value,field) =
+        e.SetColumnSilentAny(key, Choice2Of2 {Entity=value; Field = field})
+
+    member e.SetColumnAny(key,value) =        
         data.[key] <- value
         e.UpdateField key        
         e.TriggerPropertyChange key
+
+    member e.SetColumn(key,value) =  e.SetColumnAny(key,Choice1Of2 value)
+
+    member e.SetRefColumn(key,value,field) = 
+        e.SetColumnAny(key, Choice2Of2 {Entity=value; Field=field})
     
     member e.SetData(data) = data |> Seq.iter e.SetColumnSilent  
 
-    member e.SetColumnOptionSilent(key,value) =
+    member e.SetDataAny(data) = data |> Seq.iter (function (key,Choice1Of2 v) -> 
+                                                                e.SetColumnSilent(key,v)
+                                                            | (key,Choice2Of2 (refEntity : SqlEntity,field)) ->
+                                                                e.SetRefColumnSilent(key,refEntity,field))
+
+    member e.SetColumnOptionSilentAny(key,value) =
       match value with
       | Some value -> 
           if not (data.ContainsKey key) then data.Add(key,value)
           else data.[key] <- value
       | None -> data.Remove key |> ignore
 
-    member e.SetColumnOption(key,value) =
+    member e.SetColumnOptionSilent(key,value) = e.SetColumnOptionSilentAny(key, Option.bind (Choice1Of2 >> Some) value)
+
+    member e.SetRefColumnOptionSilent(key, value) = 
+        e.SetColumnOptionSilentAny(key, Option.bind (fun (e,field) -> Choice2Of2 {Entity=e;Field=field} |> Some) value)
+
+    member e.SetColumnOptionAny(key,value) =
       match value with
       | Some value -> 
-          if not (data.ContainsKey key) then data.Add(key,value)
+          if not (data.ContainsKey key) then data.Add(key, value)
           else data.[key] <- value
           e.TriggerPropertyChange key
       | None -> if data.Remove key then e.TriggerPropertyChange key
       e.UpdateField key
+
+    member e.SetColumnOption(key,value) = e.SetColumnOptionAny(key, Option.bind (Choice1Of2 >> Some) value)
+
+    member e.SetRefColumnOption(key,value) =
+        e.SetColumnOptionAny(key, Option.bind (fun (e,field) -> Choice2Of2 {Entity=e;Field=field} |> Some) value)
     
     member e.HasValue(key) = data.ContainsKey key
 
@@ -406,4 +441,5 @@ and internal ISqlProvider =
     abstract GenerateQueryText : SqlQuery * string * Table * Dictionary<string,ResizeArray<string>> -> string * ResizeArray<IDbDataParameter>
     ///Builds a command representing a call to a stored procedure
     abstract ExecuteSprocCommand : IDbCommand * SprocDefinition * QueryParameter[] *  obj[] -> ReturnValueType
+and ReferenceValue = { Entity : SqlEntity; Field : string }
     

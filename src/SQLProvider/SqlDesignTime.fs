@@ -302,21 +302,38 @@ type SqlTypeProvider(config: TypeProviderConfig) as this =
             [ 
               let containers = generateTypeTree Map.empty (sprocData.Force())
               yield! containers |> Seq.cast<MemberInfo>
+              let fkIndex = Collections.Generic.Dictionary<string,ProvidedTypeDefinition*string>()
+              let relIx (r : Relationship) = sprintf "%s;%s" r.ForeignKey r.ForeignTable
+              let cRelIx (c : ProvidedParameter) key = sprintf "%s;%s" c.Name key
               for (KeyValue(key,(entityType,desc,_))) in baseTypes.Force() do
                 // collection type, individuals type
-                let (ct,it) = baseCollectionTypes.Force().[key]
                 
+                let (ct,it) = baseCollectionTypes.Force().[key]
+                let columns,(rels,rels') = getTableData key 
+                rels |> Seq.iter (fun r -> 
+                    if relIx r |> fkIndex.ContainsKey then
+                        ()
+                    else
+                        fkIndex.Add (relIx r,(entityType,r.PrimaryKey)))
                 
                 ct.AddMembersDelayed( fun () -> 
+                                    
                     // creation methods.
                     // we are forced to load the columns here, but this is ok as the user has already 
                     // pressed . on an IQueryable type so they are obviously interested in using this entity..
-                    let columns,_ = getTableData key 
                     let (optionalColumns,columns) = columns |> List.partition(fun c->c.IsNullable || c.IsPrimarKey)
                     let normalParameters = 
                         columns 
                         |> List.map(fun c -> ProvidedParameter(c.Name,Type.GetType c.TypeMapping.ClrType))
-                        |> List.sortBy(fun p -> p.Name)                 
+                        |> List.sortBy(fun p -> p.Name)
+                    let (relParameters, relCols) =
+                        normalParameters
+                        |> List.map (fun c -> if fkIndex.ContainsKey (cRelIx c key) then
+                                                let ty,pkCol = fkIndex.[cRelIx c key]
+                                                (ProvidedParameter(c.Name,ty),Some pkCol)
+                                              else
+                                                (c, None))
+                        |> List.unzip
                     let create1 = ProvidedMethod("Create", [], entityType, InvokeCode = fun args ->                         
                         <@@ 
                             let e = new SqlEntity(((%%args.[0] : obj ):?> IWithDataContext ).DataContext,key)
@@ -343,6 +360,35 @@ type SqlTypeProvider(config: TypeProviderConfig) as this =
                               e 
                           @@>)
 
+                    let create2' = ProvidedMethod("Create", relParameters, entityType, InvokeCode = fun args -> 
+                          let dc = args.Head
+                          let args = args.Tail
+                          let columns =
+                              Expr.NewArray(
+                                      typeof<string*Choice<obj,SqlEntity*string>>,
+                                      args
+                                      |> Seq.toList
+                                      |> List.mapi(fun i v -> 
+                                                    let valExpr =
+                                                        let pkCol = relCols.[i]
+                                                        if relParameters.[i].ParameterType.IsSubclassOf(typeof<SqlEntity>) || relParameters.[i].ParameterType = typeof<SqlEntity> then
+                                                            Expr.Coerce(
+                                                                <@@ (Choice2Of2 (%%(Expr.NewTuple [ Expr.Coerce(v, typeof<SqlEntity>); Expr.Coerce(Expr.Value pkCol.Value, typeof<string>)]) : SqlEntity*string)) : Choice<obj,SqlEntity*string> @@>,
+                                                                typeof<Choice<obj,SqlEntity*string>>)
+                                                        else
+                                                            Expr.Coerce(
+                                                                <@@ (Choice1Of2 (%%(Expr.Coerce(v, typeof<obj>)) : obj)) : Choice<obj,SqlEntity*string> @@>,
+                                                                typeof<Choice<obj,SqlEntity*string>>)
+
+                                                    Expr.NewTuple [ Expr.Value relParameters.[i].Name; valExpr ] ))
+                          <@@
+                              let e = new SqlEntity(((%%dc : obj ):?> IWithDataContext ).DataContext,key)
+                              e._State <- Created
+                              e.SetDataAny(%%columns : (string*Choice<obj,SqlEntity*string>) array)
+                              ((%%dc : obj ):?> IWithDataContext ).DataContext.SubmitChangedEntity e
+                              e 
+                          @@>)
+
                     let create3 = ProvidedMethod("Create", [ProvidedParameter("data",typeof< (string*obj) seq >)] , entityType, InvokeCode = fun args -> 
                           let dc = args.[0]
                           let data = args.[1]
@@ -359,6 +405,7 @@ type SqlTypeProvider(config: TypeProviderConfig) as this =
                      yield ProvidedProperty("Individuals",Seq.head it, GetterCode = fun args -> <@@ ((%%args.[0] : obj ):?> IWithDataContext ).DataContext @@> ) :> MemberInfo
                      yield create1 :> MemberInfo
                      if normalParameters.Length > 0 then yield create2 :> MemberInfo
+                     if relParameters <> normalParameters then yield create2' :> MemberInfo
                      yield create3 :> MemberInfo } |> Seq.toList
                 )
 
